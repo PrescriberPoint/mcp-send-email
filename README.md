@@ -77,6 +77,10 @@ You can get the absolute path to your build script by right-clicking on the `/bu
 - `--key`: Your Resend API key (required)
 - `--sender`: Your sender email address from a verified domain (optional)
 - `--reply-to`: Your reply-to email address (optional)
+- `--transport`: Transport type - `stdio` (default) or `http`
+- `--port`: HTTP server port when using `--transport=http` (default: 3000)
+- `--host`: Bind address when using `--transport=http` (default: localhost)
+- `--cors-origin`: Allowed origin for CORS when using `--transport=http` (optional)
 
 > [!NOTE]
 > If you don't provide a sender email address, the MCP server will ask you to provide one each time you call the tool.
@@ -134,3 +138,102 @@ Close and reopen Claude Desktop. Verify that the `resend` tool is available in t
 ![Claude Desktop developer settings with Resend MCP server showing](https://github.com/user-attachments/assets/be9549e5-eaef-4946-b10a-e708c1864acf)
 
 Chat with Claude and tell it to send you an email using the `resend` tool.
+
+## HTTP Transport (Web Integration)
+
+The MCP Send Email server now supports HTTP transport with Server-Sent Events (SSE) for web-based integration and multiple concurrent clients.
+
+### Setup
+
+1. **Build the project** (same as above)
+
+```bash
+npm install
+npm run build
+```
+
+2. **Start the server with HTTP transport**
+
+```bash
+node build/index.js --transport=http --key=YOUR_RESEND_API_KEY
+```
+
+**HTTP-specific arguments:**
+
+- `--transport=http`: Enable HTTP transport instead of stdio
+- `--port=3000`: HTTP server port (default: 3000)
+- `--host=localhost`: Bind address (default: localhost)
+- `--cors-origin=https://your-domain.com`: Allowed origin for CORS (optional)
+
+**Complete example:**
+
+```bash
+node build/index.js \
+  --transport=http \
+  --port=3000 \
+  --host=localhost \
+  --key=YOUR_RESEND_API_KEY \
+  --sender=noreply@yourdomain.com \
+  --cors-origin=https://your-web-app.com
+```
+
+### HTTP Endpoints
+
+When running with HTTP transport, the server exposes:
+
+- **GET `/sse`**: Establishes Server-Sent Events connection for receiving messages
+- **POST `/message`**: Sends JSON-RPC messages to the server
+
+### Web Client Integration
+
+Web clients can connect to the MCP server using the streaming HTTP transport:
+
+```javascript
+// Establish SSE connection
+const eventSource = new EventSource('http://localhost:3000/sse');
+let sessionId = null;
+
+eventSource.onopen = () => {
+  console.log('Connected to MCP server');
+};
+
+eventSource.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+
+  // Extract session ID from first message
+  if (!sessionId && event.lastEventId) {
+    sessionId = event.lastEventId;
+  }
+
+  // Handle MCP responses
+  console.log('Received:', message);
+};
+
+// Send JSON-RPC message
+async function sendMessage(jsonRpcMessage) {
+  const response = await fetch('http://localhost:3000/message', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Mcp-Session-Id': sessionId
+    },
+    body: JSON.stringify(jsonRpcMessage)
+  });
+
+  return response.json();
+}
+```
+
+### Security Features
+
+- **Origin Validation**: Prevents DNS rebinding attacks by validating the Origin header
+- **CORS Configuration**: Configurable allowed origins for web client integration
+- **Localhost Binding**: Binds to localhost by default for enhanced security
+- **Session Management**: Each SSE connection gets a unique session ID
+
+### Benefits of HTTP Transport
+
+- **Multiple Clients**: Support concurrent connections from multiple clients
+- **Web Integration**: Enable direct integration with web applications
+- **Session Management**: Better state management for long-running operations
+- **Scalability**: HTTP transport scales better than stdio for multiple users

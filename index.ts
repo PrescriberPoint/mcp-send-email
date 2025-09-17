@@ -1,4 +1,11 @@
+import {
+  type IncomingMessage,
+  type ServerResponse,
+  createServer,
+} from 'node:http';
+import { URL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import minimist from 'minimist';
 import { Resend } from 'resend';
@@ -6,6 +13,18 @@ import { z } from 'zod';
 
 // Parse command line arguments
 const argv = minimist(process.argv.slice(2));
+
+// Transport configuration
+const transport = argv.transport || 'stdio'; // Default to stdio for backward compatibility
+const port = Number.parseInt(argv.port as string) || 3000;
+const host = argv.host || 'localhost';
+const corsOrigin = argv['cors-origin'] || argv.corsOrigin;
+
+// Validate transport type
+if (transport !== 'stdio' && transport !== 'http') {
+  console.error('Invalid transport type. Must be "stdio" or "http".');
+  process.exit(1);
+}
 
 // Get API key from command line argument or fall back to environment variable
 const apiKey = argv.key || process.env.RESEND_API_KEY;
@@ -203,10 +222,157 @@ server.tool(
   },
 );
 
+// HTTP server utilities
+function validateOrigin(req: IncomingMessage, allowedOrigin?: string): boolean {
+  const origin = req.headers.origin;
+
+  if (!allowedOrigin) {
+    // If no specific origin is configured, allow localhost and local development
+    if (!origin) return true; // No origin header (e.g., direct server requests)
+
+    try {
+      const originUrl = new URL(origin);
+      return (
+        originUrl.hostname === 'localhost' || originUrl.hostname === '127.0.0.1'
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  return origin === allowedOrigin;
+}
+
+function setCorsHeaders(res: ServerResponse, allowedOrigin?: string): void {
+  const origin = allowedOrigin || 'http://localhost:*';
+  res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Accept, Mcp-Session-Id',
+  );
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+}
+
+function readRequestBody(req: IncomingMessage): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk.toString();
+    });
+    req.on('end', () => {
+      resolve(body);
+    });
+    req.on('error', reject);
+  });
+}
+
+async function createHttpServer(): Promise<void> {
+  const sseTransports = new Map<string, SSEServerTransport>();
+
+  const httpServer = createServer(
+    async (req: IncomingMessage, res: ServerResponse) => {
+      // Validate Origin for security (prevent DNS rebinding attacks)
+      if (!validateOrigin(req, corsOrigin)) {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Forbidden: Invalid origin' }));
+        return;
+      }
+
+      // Set CORS headers
+      setCorsHeaders(res, corsOrigin);
+
+      // Handle preflight OPTIONS requests
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      const url = new URL(req.url || '/', `http://${host}:${port}`);
+
+      if (req.method === 'GET' && url.pathname === '/sse') {
+        // Establish SSE connection
+        const sseTransport = new SSEServerTransport('/message', res);
+        const sessionId = sseTransport.sessionId;
+        sseTransports.set(sessionId, sseTransport);
+
+        console.error(`New SSE connection established: ${sessionId}`);
+
+        // Clean up on connection close
+        sseTransport.onclose = () => {
+          console.error(`SSE connection closed: ${sessionId}`);
+          sseTransports.delete(sessionId);
+        };
+
+        sseTransport.onerror = (error) => {
+          console.error(`SSE transport error (${sessionId}):`, error);
+        };
+
+        // Connect the MCP server to this transport
+        await server.connect(sseTransport);
+        await sseTransport.start();
+      } else if (req.method === 'POST' && url.pathname === '/message') {
+        // Handle JSON-RPC messages
+        try {
+          const body = await readRequestBody(req);
+          const sessionId = req.headers['mcp-session-id'] as string;
+
+          if (!sessionId) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Missing Mcp-Session-Id header' }));
+            return;
+          }
+
+          const sseTransport = sseTransports.get(sessionId);
+          if (!sseTransport) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Session not found' }));
+            return;
+          }
+
+          // Parse and validate JSON
+          let parsedBody: unknown;
+          try {
+            parsedBody = JSON.parse(body);
+          } catch {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Invalid JSON' }));
+            return;
+          }
+
+          // Handle the message through the SSE transport
+          await sseTransport.handlePostMessage(req, res, parsedBody);
+        } catch (error) {
+          console.error('Error handling POST message:', error);
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
+      } else {
+        // 404 for other paths
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not found' }));
+      }
+    },
+  );
+
+  httpServer.listen(port, host, () => {
+    console.error(
+      `Email sending service MCP Server running on http://${host}:${port}`,
+    );
+    console.error(`SSE endpoint: http://${host}:${port}/sse`);
+    console.error(`Message endpoint: http://${host}:${port}/message`);
+  });
+}
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('Email sending service MCP Server running on stdio');
+  if (transport === 'http') {
+    await createHttpServer();
+  } else {
+    const stdioTransport = new StdioServerTransport();
+    await server.connect(stdioTransport);
+    console.error('Email sending service MCP Server running on stdio');
+  }
 }
 
 main().catch((error) => {
